@@ -1,21 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=vllm-pd    # Specify a custom string for your slurm batch job
-#SBATCH -N 3           # Request N+1 nodes
-#SBATCH -n 3          # Request N+1 total tasks
+#SBATCH --job-name=vllm-pd
+#SBATCH -N 4
+#SBATCH -n 4
 #SBATCH --ntasks-per-node=1
 #SBATCH --spread-job
-#SBATCH --gres=gpu:8      # Request 8 GPUs and 8 NICs (use --gres if specific GPU resources are needed)
-#SBATCH --time=24:00:00         # Set a time limit for the job (HH:MM:SS)
-#SBATCH --output="/shared_inference/%u/model_blog_logs/slurm-%j.out"
-#SBATCH --error="/shared_inference/%u/model_blog_logs/slurm-%j.err"
+#SBATCH --gres=gpu:8
+#SBATCH --time=24:00:00
+#SBATCH --output="/tmp/vllm-pd-slurm-%j.out"
+#SBATCH --error="/tmp/vllm-pd-slurm-%j.err"
 
-
-# ------------------------
-# Print current time in UTC and PST formats
-# ------------------------
 echo "=== Job Start Time ==="
 echo "UTC Time: $(TZ=UTC date '+%Y-%m-%d %H:%M:%S %Z')"
-echo "PST Time: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "======================="
 echo ""
 
@@ -24,289 +19,160 @@ VALID_MODELS=( \
     "Llama-3.1-405B-Instruct-FP8-KV" \
     "amd-Llama-3.3-70B-Instruct-FP8-KV" \
     "DeepSeek-V3" \
+    "DeepSeek-R1-0528" \
     "gpt-oss-120b" \
 )
 
-
-# Each model has an associated run file - Set it here
 declare -A MODEL_RUNFILES=(
     ["Llama-3.1-405B-Instruct-FP8-KV"]="vllm_disagg_server.sh"
     ["amd-Llama-3.3-70B-Instruct-FP8-KV"]="vllm_disagg_server.sh"
     ["DeepSeek-V3"]="vllm_disagg_server.sh"
+    ["DeepSeek-R1-0528"]="vllm_disagg_server.sh"
     ["gpt-oss-120b"]="vllm_disagg_server.sh"
 )
 
-# Check if MODEL_NAME exists and fetch runfile
+# HF cache directory names differ from MODEL_NAME
+declare -A MODEL_DIR_NAMES=(
+    ["DeepSeek-R1-0528"]="models--deepseek-ai--DeepSeek-R1-0528"
+)
+
 if [[ -n "${MODEL_RUNFILES[$MODEL_NAME]}" ]]; then
     RUN_FILE="${MODEL_RUNFILES[$MODEL_NAME]}"
-    echo "Model found: $MODEL_NAME"
-    echo "Runfile set: $RUN_FILE"
+    echo "Model found: $MODEL_NAME -> $RUN_FILE"
 else
-    echo "Error: Model '$MODEL_NAME' not found in MODEL_RUNFILES"
-    echo "Available models: ${!MODEL_RUNFILES[@]}"
+    echo "Error: Model '$MODEL_NAME' not found. Available: ${!MODEL_RUNFILES[@]}"
     exit 1
 fi
 
-export DOCKER_IMAGE_NAME="${DOCKER_IMAGE_NAME:-rocm/vllm:v0.14.0_amd_dev}"
+export DOCKER_IMAGE_NAME="${DOCKER_IMAGE_NAME:-vllm_disagg_pd:latest}"
 if test -z "${DOCKER_IMAGE_NAME}"; then
-  echo "Error: DOCKER_IMAGE_NAME is not set or empty."
-  exit 1
+    echo "Error: DOCKER_IMAGE_NAME is not set or empty."; exit 1
 fi
 
-# Set current directory to be REPO directory with all relevant scripts
-NIXL_REPO_DIR=$(pwd)
-LOG_PATH="${LOG_PATH:-/shared_inference/${USER}/model_blog_logs}"
+# Use NFS path so all nodes can access the scripts
+NIXL_REPO_DIR="${NIXL_REPO_DIR:-/nfsdata/vllm_disagg_scripts}"
+LOG_PATH="${LOG_PATH:-/tmp/vllm_disagg_logs}"
 
-xP="${xP:-1}" #-> Number of Prefill Servers
-yD="${yD:-1}" #-> Number of Decode Servers
-
+xP="${xP:-1}"
+yD="${yD:-1}"
 MODEL_NAME="${MODEL_NAME:-None}"
-MODEL_DIR="${MODEL_DIR:-"/shared_inference/models_blog/"}"
+MODEL_DIR="${MODEL_DIR:-/nfsdata/hf_hub_cache-0}"
 
 validate_model_name() {
-  local is_valid_model=false
-
-  for model in "${VALID_MODELS[@]}"; do
-    if [[ "$MODEL_NAME" == "$model" ]]; then
-      is_valid_model=true
-      break
-    fi
-  done
-
-  if ! $is_valid_model; then
-    printf "Error: Invalid MODEL_NAME: '%s'\nValid models are:\n" "$MODEL_NAME"
     for model in "${VALID_MODELS[@]}"; do
-      printf "  - %s\n" "$model"
+        [[ "$MODEL_NAME" == "$model" ]] && return 0
     done
+    printf "Error: Invalid MODEL_NAME: '%s'\nValid models:\n" "$MODEL_NAME"
+    for model in "${VALID_MODELS[@]}"; do printf "  - %s\n" "$model"; done
     exit 1
-  fi
-
-  echo "MODEL_NAME '$MODEL_NAME' is valid."
-  return 0
 }
-
-validate_model_name "${MODEL_NAME}"
-
+validate_model_name
 
 # ------------------------
-# Model path validation and selection across all nodes
+# Model path resolution
 # ------------------------
-ORIGINAL_MODEL_PATH="/shared_inference/models_blog/${MODEL_NAME}"
+DISK_DIR_NAME="${MODEL_DIR_NAMES[$MODEL_NAME]:-$MODEL_NAME}"
+echo "Looking for model: $MODEL_NAME (disk dir: $DISK_DIR_NAME)"
 
-echo "Looking for model: $MODEL_NAME"
-echo "Checking model availability across all allocated nodes..."
-
-# Get all allocated nodes
-ALL_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-TOTAL_NODES=$(echo "$ALL_NODES" | wc -l)
-
-echo "Total allocated nodes: $TOTAL_NODES"
-echo "Nodes: $(echo "$ALL_NODES" | tr '\n' ' ')"
-
-# Function to check model path on all nodes
-check_model_path() {
-    local path=$1
-    local check_name=$2
-
-    echo "Checking $check_name: $path"
-
-    # Run check on all nodes in parallel
-    srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES /bin/bash -c "
-        if [ -d '$path' ]; then
-            echo \"\$(hostname): ✓ Found $path\"
-            exit 0
-        else
-            echo \"\$(hostname): ✗ Missing $path\"
-            exit 1
+# Resolve HF cache snapshot path
+resolve_hf_cache_path() {
+    local base_path=$1
+    if [[ -d "${base_path}/snapshots" ]]; then
+        local snapshot=$(ls -1 "${base_path}/snapshots" 2>/dev/null | head -1)
+        if [[ -n "$snapshot" ]]; then
+            echo "${base_path}/snapshots/${snapshot}"
+            return 0
         fi
-    "
-
-    # Check if all nodes succeeded (exit code 0)
-    local exit_code=$?
-    if [ $exit_code -eq 0 ]; then
-        echo "✓ $check_name available on ALL nodes"
-        return 0
-    else
-        echo "✗ $check_name NOT available on all nodes"
-        return 1
     fi
+    echo "$base_path"
+    return 1
 }
 
-# Check /mnt/m2m_nobackup/models_blog first
-MODEL_PATH_1="/mnt/m2m_nobackup/models_blog/$MODEL_NAME"
-if check_model_path "$MODEL_PATH_1" "/mnt/m2m_nobackup/models_blog"; then
-    MODEL_PATH="$MODEL_PATH_1"
-    echo ""
-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
-# Check /shared-inference/models_blog
-elif check_model_path "/shared_inference/models_blog/$MODEL_NAME" "/shared_inference/models_blog"; then
-    MODEL_PATH="/shared_inference/models_blog/$MODEL_NAME"
-    echo ""
-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
-elif check_model_path "$MODEL_DIR/$MODEL_NAME" "$MODEL_DIR"; then
-    MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
-    echo ""
-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
-else
-    echo ""
-    echo "✗ FATAL ERROR: Model '$MODEL_NAME' not found on ALL allocated nodes in either:"
-    echo "  - /mnt/m2m_nobackup/models_blog/$MODEL_NAME"
-    echo "  - /shared_inference/models_blog/$MODEL_NAME"
-    echo ""
-    echo "Model must be accessible from all nodes for distributed execution."
-    echo "Please ensure the model is available on all allocated nodes."
+MODEL_PATH=""
+SEARCH_PATHS=(
+    "/nfsdata/hf_hub_cache-0/${DISK_DIR_NAME}"
+    "/mnt/m2m_nobackup/models_blog/${DISK_DIR_NAME}"
+    "/shared_inference/models_blog/${DISK_DIR_NAME}"
+    "${MODEL_DIR}/${DISK_DIR_NAME}"
+    "/nfsdata/hf_hub_cache-0/${MODEL_NAME}"
+    "/shared_inference/models_blog/${MODEL_NAME}"
+    "${MODEL_DIR}/${MODEL_NAME}"
+)
+
+for search_path in "${SEARCH_PATHS[@]}"; do
+    if [[ -d "$search_path" ]]; then
+        RESOLVED=$(resolve_hf_cache_path "$search_path")
+        MODEL_PATH="$RESOLVED"
+        echo "✓ Found MODEL_PATH: $MODEL_PATH"
+        break
+    fi
+done
+
+if [[ -z "$MODEL_PATH" ]]; then
+    echo "FATAL: Model '$MODEL_NAME' not found. Searched:"
+    for p in "${SEARCH_PATHS[@]}"; do echo "  - $p"; done
     exit 1
 fi
-
 echo "Final MODEL_PATH: $MODEL_PATH"
-echo ""
 
-
-# Calculate NUM_NODES based on xP and yD
+# Calculate NUM_NODES
 NUM_NODES=$((xP + yD + 1))
-echo "Calculated NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD + 1)"
-echo "Calculated NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD + 1)"
+echo "NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD + 1)"
 
 # ------------------------
-# Extract first NUM_NODES from SLURM allocation and update SLURM variables
+# Node selection from SLURM allocation
 # ------------------------
-echo "Original SLURM allocation:"
-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
-echo "SLURM_NNODES: $SLURM_NNODES"
-echo "SLURM_NTASKS: $SLURM_NTASKS"
-
-# Get the full nodelist and extract first NUM_NODES
 FULL_NODELIST=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 SELECTED_NODES=$(echo "$FULL_NODELIST" | head -n $NUM_NODES)
-SELECTED_NODELIST_STR=$(echo "$SELECTED_NODES" | tr '\n' ',' | sed 's/,$//')
 
-# Create new nodelist in SLURM format
-# This is a simplified approach - for complex ranges, you might need more sophisticated parsing
-NEW_SLURM_NODELIST=$(echo "$SELECTED_NODES" | paste -sd, | sed 's/,/,/g')
-
-# Update SLURM environment variables
 export SLURM_NNODES=$NUM_NODES
 export SLURM_NTASKS=$NUM_NODES
 export SLURM_JOB_NUM_NODES=$NUM_NODES
 export SLURM_NPROCS=$NUM_NODES
+NEW_SLURM_NODELIST=$(echo "$SELECTED_NODES" | paste -sd,)
 export SLURM_JOB_NODELIST="$NEW_SLURM_NODELIST"
 export SLURM_NODELIST="$NEW_SLURM_NODELIST"
-
-# Keep other SLURM variables as they were or set defaults
 export SLURM_TASKS_PER_NODE="1(x$NUM_NODES)"
-
-export SLURM_CLUSTER_NAME="${SLURM_CLUSTER_NAME}"
-export SLURM_JOB_CPUS_PER_NODE="${SLURM_JOB_CPUS_PER_NODE}"
-export SLURM_JOB_PARTITION="${SLURM_JOB_PARTITION}"
-export SLURM_JOBID="${SLURM_JOBID:-$SLURM_JOB_ID}"
-export SLURM_JOB_QOS="${SLURM_JOB_QOS:-normal}"
-export SLURM_JOB_ACCOUNT="${SLURM_JOB_ACCOUNT}"
 export SLURM_NTASKS_PER_NODE=1
-export SLURM_SUBMIT_HOST="${SLURM_SUBMIT_HOST}"
-export SLURM_JOB_ID="${SLURM_JOB_ID}"
-export SLURM_CONF="${SLURM_CONF:-/etc/slurm/slurm.conf}"
-export SLURM_JOB_NAME="${SLURM_JOB_NAME:-1p1d_bench-serving}"
 
-echo ""
-echo "Updated SLURM Environment Variables:"
-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
-echo "SLURM_NNODES: $SLURM_NNODES"
-echo "SLURM_NTASKS: $SLURM_NTASKS"
-echo "SLURM_TASKS_PER_NODE: $SLURM_TASKS_PER_NODE"
-echo "SLURM_JOB_CPUS_PER_NODE: $SLURM_JOB_CPUS_PER_NODE"
-echo "SLURM_JOB_PARTITION: $SLURM_JOB_PARTITION"
-echo "SLURM_JOB_NUM_NODES: $SLURM_JOB_NUM_NODES"
-echo "SLURM_JOBID: $SLURM_JOBID"
-echo "SLURM_JOB_QOS: $SLURM_JOB_QOS"
-echo "SLURM_NODELIST: $SLURM_NODELIST"
-echo "SLURM_JOB_ACCOUNT: $SLURM_JOB_ACCOUNT"
-echo "SLURM_NPROCS: $SLURM_NPROCS"
-echo "SLURM_SUBMIT_HOST: $SLURM_SUBMIT_HOST"
-echo "SLURM_CONF: $SLURM_CONF"
-echo "SLURM_JOB_NAME: $SLURM_JOB_NAME"
-echo "SLURM_NTASKS_PER_NODE: $SLURM_NTASKS_PER_NODE"
-#echo "SLURM_SUBMIT_DIR: $SLURM_SUBMIT_DIR"
-echo "SLURM_CLUSTER_NAME: $SLURM_CLUSTER_NAME"
-echo "ulimit: $(ulimit -a)"
-echo ""
-echo "Selected nodes for execution:"
-echo "$SELECTED_NODES"
-echo ""
+echo "Selected nodes: $NEW_SLURM_NODELIST"
 
-# MAke sure xP*8 and yD*8 are multiple of by 129280 for Deepseek V3
-
-# ------------------------
-# SLURM Environment Variables
-# ------------------------
-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
-echo "SLURM_NNODES: $SLURM_NNODES"
-echo "SLURM_NTASKS: $SLURM_NTASKS"
-echo "SLURM_TASKS_PER_NODE: $SLURM_TASKS_PER_NODE"
-echo "SLURM_JOB_CPUS_PER_NODE: $SLURM_JOB_CPUS_PER_NODE"
-echo "ulimit: $(ulimit -a)"
-echo ""
-
-# Node information
+# Resolve IPs
 USER_NAME=$(whoami)
 MASTER_NODE=$(echo "$SELECTED_NODES" | head -n 1)
-MASTER_ADDR=$(srun --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$MASTER_NODE" bash -c 'hostname -I')
-MASTER_ADDR=$(echo "$MASTER_ADDR" | awk 'NR==1 {print $1}')
-MASTER_PORT=39566  # Choose an open port
+# Use default route source IP (management network) for inter-node TCP communication
+MASTER_ADDR=$(srun --chdir=/tmp --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$MASTER_NODE" bash -c 'ip route get 1.1.1.1 | sed -n "s/.*src \([^ ]*\).*/\1/p"')
+MASTER_ADDR=$(echo "$MASTER_ADDR" | head -1 | tr -d '[:space:]')
+MASTER_PORT=39566
 
 IPS=()
-
 for NODE in $SELECTED_NODES; do
-    IP=$(srun --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$NODE" bash -c 'hostname -I')
-    IP=$(echo "$IP" | awk 'NR==1 {print $1}')
+    IP=$(srun --chdir=/tmp --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$NODE" bash -c 'ip route get 1.1.1.1 | sed -n "s/.*src \([^ ]*\).*/\1/p"')
+    IP=$(echo "$IP" | head -1 | tr -d '[:space:]')
     IPS+=("$IP")
 done
 
-echo "Selected node IPs: ${IPS[*]}" | sed 's/ /,/g'
+echo "Node IPs: ${IPS[*]}"
 
 NIXL_COOKBOOK_PATH="/opt/nixl-vllm-cookbook"
-BENCHMARK_FILE="${BENCHMARK_FILE:-$NIXL_COOKBOOK_PATH/dissag_blog_p1/models_blog/run_xPyD_models.slurm}"
-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
-
 NNODES=$NUM_NODES
 
-echo "MASTER_NODE is ${MASTER_NODE}"
-echo "MASTER_ADDR is ${MASTER_ADDR}"
-echo "MASTER_PORT is ${MASTER_PORT}"
-echo "NNODES is ${NNODES}"
-echo "REPO Directory is ${MOONCAKE_REPO_DIR}"
+echo "MASTER_NODE=$MASTER_NODE  MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
 
-if [ ! -d "$LOG_PATH" ]; then
-    mkdir -p "$LOG_PATH"
-    echo "Created directory: $LOG_PATH"
-else
-    echo "Directory already exists: $LOG_PATH"
-fi
+mkdir -p "$LOG_PATH"
 
-export LOG_PATH=$LOG_PATH
-export NIXL_REPO_DIR=$NIXL_REPO_DIR
-export NIXL_COOKBOOK_PATH=$NIXL_COOKBOOK_PATH
-export NNODES=$NNODES
-export MASTER_ADDR=$MASTER_ADDR
-export MASTER_PORT=$MASTER_PORT
-export MODEL_PATH=$MODEL_PATH
-export xP=$xP
-export yD=$yD
-export MODEL_NAME=$MODEL_NAME
-export USER_NAME=$USER_NAME
+export LOG_PATH NIXL_REPO_DIR NIXL_COOKBOOK_PATH NNODES MASTER_ADDR MASTER_PORT MODEL_PATH
+export xP yD MODEL_NAME USER_NAME
 export IPADDRS="$(echo "${IPS[*]}" | sed 's/ /,/g')"
-
 export DOCKER_CONT_NAME="container_${MODEL_NAME}_${SLURM_JOB_ID}"
 export RUN_FILE_FULL="$NIXL_COOKBOOK_PATH/${RUN_FILE}"
 
-# Use only the selected nodes for srun execution
 SELECTED_NODELIST_SRUN=$(echo "$SELECTED_NODES" | paste -sd,)
 
-srun --nodelist="$SELECTED_NODELIST_SRUN" bash -c '
+srun --chdir=/tmp --nodelist="$SELECTED_NODELIST_SRUN" bash -c '
 echo "Rank $SLURM_PROCID on $(hostname)";
-docker ps -q | xargs --no-run-if-empty docker stop;
-docker run --rm \
+sudo docker ps -q | xargs --no-run-if-empty sudo docker stop;
+sudo docker run --rm \
     --device /dev/dri \
     --device /dev/kfd \
     --device /dev/infiniband \
@@ -317,6 +183,7 @@ docker run --rm \
     --security-opt seccomp=unconfined \
     --privileged \
     -v $HOME:$HOME \
+    -v /nfsdata:/nfsdata \
     -v /shared_inference:/shared_inference \
     -v /mnt/m2m_nobackup:/mnt/m2m_nobackup \
     -v $HOME/.ssh:/root/.ssh \
@@ -336,16 +203,23 @@ docker run --rm \
     -e yD=$yD \
     -e USER_NAME=$USER_NAME \
     -e MODEL_NAME=$MODEL_NAME \
-    -e BENCHMARK_FILE=$BENCHMARK_FILE \
     -e IPADDRS=$IPADDRS \
     -e PROXY_TYPE=${PROXY_TYPE:-vllm_router} \
     -e ROUTER_PORT=${ROUTER_PORT:-2584} \
     -e BENCHMARK_PORT=${BENCHMARK_PORT:-2584} \
+    -e DRY_RUN=${DRY_RUN:-0} \
+    -e UCX_TLS=all \
+    -e UCX_SOCKADDR_TLS_PRIORITY=tcp \
+    -e UCX_MEMTYPE_CACHE=y \
+    -e UCX_RNDV_SCHEME=get_zcopy \
+    -e UCX_RNDV_THRESH=4k \
+    -e UCX_ROCM_IPC_MIN_ZCOPY=0 \
+    -e UCX_LOG_LEVEL=info \
+    -e HSA_ENABLE_SDMA=1 \
     --name $DOCKER_CONT_NAME \
     $DOCKER_IMAGE_NAME bash -c "
         mkdir -p /run_logs/${SLURM_JOB_ID}
         $RUN_FILE_FULL 2>&1 | tee /run_logs/${SLURM_JOB_ID}/pd_vllm_bench_NODE${SLURM_PROCID}.log
     "
 '
-srun --nodelist="$SELECTED_NODELIST_SRUN" bash -c 'docker stop $DOCKER_CONT_NAME; docker rm $DOCKER_CONT_NAME'
-
+srun --chdir=/tmp --nodelist="$SELECTED_NODELIST_SRUN" bash -c 'sudo docker stop $DOCKER_CONT_NAME 2>/dev/null; sudo docker rm $DOCKER_CONT_NAME 2>/dev/null'

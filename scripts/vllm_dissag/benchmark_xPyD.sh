@@ -2,13 +2,15 @@
 
 timestamp=$(date "+%Y%m%d_%H%M%S")
 BENCHMARK_PORT="${BENCHMARK_PORT:-2584}"
+BENCH_NUM_PROMPTS_MULTIPLIER="${BENCH_NUM_PROMPTS_MULTIPLIER:-10}"
 LOG="/run_logs/${SLURM_JOB_ID}/benchmark_${SLURM_JOB_ID}_${timestamp}_xP${xP}_yD${yD}_$MODEL_NAME"
 
 echo "==== Benchmark Serving Concurrency Sweep Test ${LOG} ===== "
 echo "Benchmark Port: ${BENCHMARK_PORT}"
+echo "Model Path: ${MODEL_PATH}"
 echo "UTC Time: $(TZ=UTC date '+%Y-%m-%d %H:%M:%S %Z')" | tee -a ${LOG}_CONCURRENCY.log >/dev/null
 echo "PST Time: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')" | tee -a ${LOG}_CONCURRENCY.log >/dev/null
- 
+
 echo ""
 
 CON="8 16 32 64 128 256 512"
@@ -19,11 +21,11 @@ for i in {1..1}; do
     for combo in "${COMBINATIONS[@]}"; do
        IFS="/" read -r isl osl <<< "$combo"
        for con in $CON; do
-           p_con=$(($con * 2))
+           p_con=$(($con * $BENCH_NUM_PROMPTS_MULTIPLIER))
            if [ "$p_con" -lt 16 ]; then
                p_con=16
            fi
-           echo "[RUNNING] prompts $prompts isl $isl osl $osl con $con"
+           echo "[RUNNING] prompts $p_con isl $isl osl $osl con $con"
            vllm bench serve \
            --model $MODEL_PATH \
            --backend vllm \

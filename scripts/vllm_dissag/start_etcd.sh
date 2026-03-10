@@ -1,15 +1,17 @@
 #!/bin/bash
 set -x
-# Define the full list of cluster IPs
+
 IPADDRS="${IPADDRS:-localhost}"
 
-# Automatically detect this host's IP (assuming it's the IP on the correct network)
-host_ip=$(hostname -I | awk '{print $1}')
+# Use management network IP (matching what the Slurm script resolved)
+host_ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p')
+if [[ -z "$host_ip" ]]; then
+    host_ip=$(hostname -I | awk '{print $1}')
+fi
 
-# Convert comma-separated IP list into an array
 IFS=',' read -ra ADDR <<< "$IPADDRS"
 
-# Determine node name based on position in list
+# Determine node name based on position in the IPADDRS list
 index=0
 for ip in "${ADDR[@]}"; do
   if [[ "$ip" == "$host_ip" ]]; then
@@ -29,13 +31,10 @@ for i in "${!ADDR[@]}"; do
   fi
 done
 
-# Prepare etcd data directory
 mkdir -p /var/lib/etcd
-
 rm -rf /var/lib/etcd/*
 
-# Run etcd with full config
-/usr/local/bin/etcd//etcd \
+/usr/local/bin/etcd/etcd \
   --name "$node_name" \
   --data-dir /var/lib/etcd \
   --initial-advertise-peer-urls http://$host_ip:2380 \
