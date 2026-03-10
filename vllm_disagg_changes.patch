@@ -1,0 +1,1365 @@
+diff --git a/scripts/vllm_dissag/README.MD b/scripts/vllm_dissag/README.MD
+deleted file mode 100644
+index fd98dfd..0000000
+--- a/scripts/vllm_dissag/README.MD
++++ /dev/null
+@@ -1,67 +0,0 @@
+-## List of Models - focus VLLM Dissagerated P/D inference
+-
+-Dense Models
+-- deepseek-ai/DeepSeek-V3 (https://huggingface.co/deepseek-ai/DeepSeek-V3)
+-- amd/Llama-3.3-70B-Instruct-FP8-KV (https://huggingface.co/amd/Llama-3.3-70B-Instruct-FP8-KV)
+-- amd/Llama-3.1-405B-Instruct-FP8-KV (https://huggingface.co/amd/Llama-3.1-405B-Instruct-FP8-KV)
+-- openai/gpt-oss-120b - (https://huggingface.co/openai/gpt-oss-120b)
+-
+-This repository contains scripts and documentation to launch PD Disaggregation using the Nixl framework for above models. You will find setup instructions, node assignment details and benchmarking commands.
+-
+-## 📝 Prerequisites
+-
+-- A Slurm cluster with required Nodes -> xP + yD + 1 (minimum size 3: xP=1 and xD=1)
+-- Docker container with VLLM, Nixl, etcd and NIC drivers built-in. Refer to Building the Docker image section below.
+-- Access to a shared filesystem for log collection( cluster specific)
+-
+-
+-## Building the Docker image
+-
+-
+-```bash
+-docker build  -t vllm_dissag_pd_image -f vllm_dissag_inference.ubuntu.amd.Dockerfile .
+-```
+-
+-## Scripts and Benchmarking
+-Run instructions - scripts/vllm_dissag/README.MD
+-
+-Few files of significance:
+-
+-scripts/vllm_dissag/run_xPyD_models.slurm - slurm script to launch docker containers on all nodes using sbatch or salloc  
+-scripts/vllm_dissag/vllm_disagg_server.sh - Script that runs inside each docker to start required proxy, prefill and decode services
+-scripts/vllm_dissag/benchmark_xPyD.sh - Benchmark script to run VLLM benchmarking tool for performance measurement
+-
+-## Sbatch run command (one-liner)
+-```bash
+-
+-# Clone the repo
+-git clone https://github.com/ROCm/MAD.git
+-cd scripts/vllm_dissag
+-
+-# Sbatch run command [run from the above folder]
+-export DOCKER_IMAGE_NAME=<DOCKER IMAGE NAME>
+-export xP=<num_prefill_nodes>; export yD=<num_decode_nodes>; export MODEL_NAME=Llama-3.1-8B-Instruct; sbatch -N <num_nodes> -n <num_nodes> --nodelist=<Nodes> run_xPyD_models.slurm
+-
+-# num_nodes = xP + xD + 1
+-```
+-
+-## Proxy Server Options
+-
+-The scripts support two proxy server types via the `PROXY_TYPE` environment variable:
+-
+-| Proxy Type | Description |
+-|------------|-------------|
+-| `vllm_router` (default) | Production-grade Rust-based load balancer |
+-| `toy_proxy` | Simple Python-based proxy for testing |
+-
+-### Using Toy Proxy (for testing)
+-```bash
+-export PROXY_TYPE=toy_proxy
+-# Then run sbatch/srun as usual
+-```
+-
+-## Benchmark parser ( for CONCURRENCY logs) to tabulate different data
+-
+-```bash
+-python3 benchmark_parser.py <log_path/benchmark_XXX_CONCURRENCY.log
+-```
+diff --git a/scripts/vllm_dissag/benchmark_xPyD.sh b/scripts/vllm_dissag/benchmark_xPyD.sh
+index 1e3c541..677456a 100755
+--- a/scripts/vllm_dissag/benchmark_xPyD.sh
++++ b/scripts/vllm_dissag/benchmark_xPyD.sh
+@@ -2,13 +2,15 @@
+ 
+ timestamp=$(date "+%Y%m%d_%H%M%S")
+ BENCHMARK_PORT="${BENCHMARK_PORT:-2584}"
++BENCH_NUM_PROMPTS_MULTIPLIER="${BENCH_NUM_PROMPTS_MULTIPLIER:-10}"
+ LOG="/run_logs/${SLURM_JOB_ID}/benchmark_${SLURM_JOB_ID}_${timestamp}_xP${xP}_yD${yD}_$MODEL_NAME"
+ 
+ echo "==== Benchmark Serving Concurrency Sweep Test ${LOG} ===== "
+ echo "Benchmark Port: ${BENCHMARK_PORT}"
++echo "Model Path: ${MODEL_PATH}"
+ echo "UTC Time: $(TZ=UTC date '+%Y-%m-%d %H:%M:%S %Z')" | tee -a ${LOG}_CONCURRENCY.log >/dev/null
+ echo "PST Time: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')" | tee -a ${LOG}_CONCURRENCY.log >/dev/null
+- 
++
+ echo ""
+ 
+ CON="8 16 32 64 128 256 512"
+@@ -19,11 +21,11 @@ for i in {1..1}; do
+     for combo in "${COMBINATIONS[@]}"; do
+        IFS="/" read -r isl osl <<< "$combo"
+        for con in $CON; do
+-           p_con=$(($con * 2))
++           p_con=$(($con * $BENCH_NUM_PROMPTS_MULTIPLIER))
+            if [ "$p_con" -lt 16 ]; then
+                p_con=16
+            fi
+-           echo "[RUNNING] prompts $prompts isl $isl osl $osl con $con"
++           echo "[RUNNING] prompts $p_con isl $isl osl $osl con $con"
+            vllm bench serve \
+            --model $MODEL_PATH \
+            --backend vllm \
+diff --git a/scripts/vllm_dissag/env.sh b/scripts/vllm_dissag/env.sh
+new file mode 100755
+index 0000000..2679a59
+--- /dev/null
++++ b/scripts/vllm_dissag/env.sh
+@@ -0,0 +1,43 @@
++#!/bin/bash
++# vLLM/Nixl environment setup for multi-node disaggregated serving.
++#
++# Auto-detects RDMA devices and network interfaces from hostname or ibv_devinfo.
++# The Docker image (built from vllm_disagg_inference.ubuntu.amd.Dockerfile) already
++# sets LD_LIBRARY_PATH for UCX (/usr/local/ucx/lib) and RIXL (/usr/local/RIXL/install/lib).
++
++set -x
++
++if [[ -z "$IBDEVICES" ]]; then
++    NODENAME=$(hostname -s)
++    if [[ $NODENAME == GPU* ]] || [[ $NODENAME == smci355-ccs-aus* ]]; then
++        export IBDEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
++    elif [[ $NODENAME == mia1* ]]; then
++        export IBDEVICES=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
++    else
++        DETECTED=$(ibv_devinfo 2>/dev/null | grep "hca_id:" | awk '{print $2}' | paste -sd',')
++        if [[ -n "$DETECTED" ]]; then
++            export IBDEVICES="$DETECTED"
++        else
++            echo "WARNING: Unable to detect RDMA devices. Set IBDEVICES explicitly." >&2
++        fi
++    fi
++    echo "[INFO] Auto-detected IBDEVICES=$IBDEVICES from hostname $(hostname -s)"
++else
++    echo "[INFO] Using IBDEVICES=$IBDEVICES (set by environment)"
++fi
++
++if [[ -z "$UCX_NET_DEVICES" ]]; then
++    FIRST_IB=$(echo "$IBDEVICES" | cut -d',' -f1)
++    if [[ -n "$FIRST_IB" ]]; then
++        export UCX_NET_DEVICES="${FIRST_IB}:1"
++    fi
++    echo "[INFO] Auto-set UCX_NET_DEVICES=$UCX_NET_DEVICES"
++else
++    echo "[INFO] Using UCX_NET_DEVICES=$UCX_NET_DEVICES (set by environment)"
++fi
++
++export NCCL_SOCKET_IFNAME=$(ip route | grep '^default' | awk '{print $5}' | head -n 1)
++export NCCL_IB_HCA=${NCCL_IB_HCA:-$IBDEVICES}
++
++set +x
++echo "[INFO] IBDEVICES=$IBDEVICES  UCX_NET_DEVICES=$UCX_NET_DEVICES  NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
+diff --git a/scripts/vllm_dissag/run_xPyD_models.slurm b/scripts/vllm_dissag/run_xPyD_models.slurm
+index 26f02ca..f625c02 100755
+--- a/scripts/vllm_dissag/run_xPyD_models.slurm
++++ b/scripts/vllm_dissag/run_xPyD_models.slurm
+@@ -1,21 +1,16 @@
+ #!/bin/bash
+-#SBATCH --job-name=vllm-pd    # Specify a custom string for your slurm batch job
+-#SBATCH -N 3           # Request N+1 nodes
+-#SBATCH -n 3          # Request N+1 total tasks
++#SBATCH --job-name=vllm-pd
++#SBATCH -N 4
++#SBATCH -n 4
+ #SBATCH --ntasks-per-node=1
+ #SBATCH --spread-job
+-#SBATCH --gres=gpu:8      # Request 8 GPUs and 8 NICs (use --gres if specific GPU resources are needed)
+-#SBATCH --time=24:00:00         # Set a time limit for the job (HH:MM:SS)
+-#SBATCH --output="/shared_inference/%u/model_blog_logs/slurm-%j.out"
+-#SBATCH --error="/shared_inference/%u/model_blog_logs/slurm-%j.err"
++#SBATCH --gres=gpu:8
++#SBATCH --time=24:00:00
++#SBATCH --output="/tmp/vllm-pd-slurm-%j.out"
++#SBATCH --error="/tmp/vllm-pd-slurm-%j.err"
+ 
+-
+-# ------------------------
+-# Print current time in UTC and PST formats
+-# ------------------------
+ echo "=== Job Start Time ==="
+ echo "UTC Time: $(TZ=UTC date '+%Y-%m-%d %H:%M:%S %Z')"
+-echo "PST Time: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
+ echo "======================="
+ echo ""
+ 
+@@ -24,289 +19,160 @@ VALID_MODELS=( \
+     "Llama-3.1-405B-Instruct-FP8-KV" \
+     "amd-Llama-3.3-70B-Instruct-FP8-KV" \
+     "DeepSeek-V3" \
++    "DeepSeek-R1-0528" \
+     "gpt-oss-120b" \
+ )
+ 
+-
+-# Each model has an associated run file - Set it here
+ declare -A MODEL_RUNFILES=(
+     ["Llama-3.1-405B-Instruct-FP8-KV"]="vllm_disagg_server.sh"
+     ["amd-Llama-3.3-70B-Instruct-FP8-KV"]="vllm_disagg_server.sh"
+     ["DeepSeek-V3"]="vllm_disagg_server.sh"
++    ["DeepSeek-R1-0528"]="vllm_disagg_server.sh"
+     ["gpt-oss-120b"]="vllm_disagg_server.sh"
+ )
+ 
+-# Check if MODEL_NAME exists and fetch runfile
++# HF cache directory names differ from MODEL_NAME
++declare -A MODEL_DIR_NAMES=(
++    ["DeepSeek-R1-0528"]="models--deepseek-ai--DeepSeek-R1-0528"
++)
++
+ if [[ -n "${MODEL_RUNFILES[$MODEL_NAME]}" ]]; then
+     RUN_FILE="${MODEL_RUNFILES[$MODEL_NAME]}"
+-    echo "Model found: $MODEL_NAME"
+-    echo "Runfile set: $RUN_FILE"
++    echo "Model found: $MODEL_NAME -> $RUN_FILE"
+ else
+-    echo "Error: Model '$MODEL_NAME' not found in MODEL_RUNFILES"
+-    echo "Available models: ${!MODEL_RUNFILES[@]}"
++    echo "Error: Model '$MODEL_NAME' not found. Available: ${!MODEL_RUNFILES[@]}"
+     exit 1
+ fi
+ 
+-export DOCKER_IMAGE_NAME="${DOCKER_IMAGE_NAME:-rocm/vllm:v0.14.0_amd_dev}"
++export DOCKER_IMAGE_NAME="${DOCKER_IMAGE_NAME:-vllm_disagg_pd:latest}"
+ if test -z "${DOCKER_IMAGE_NAME}"; then
+-  echo "Error: DOCKER_IMAGE_NAME is not set or empty."
+-  exit 1
++    echo "Error: DOCKER_IMAGE_NAME is not set or empty."; exit 1
+ fi
+ 
+-# Set current directory to be REPO directory with all relevant scripts
+-NIXL_REPO_DIR=$(pwd)
+-LOG_PATH="${LOG_PATH:-/shared_inference/${USER}/model_blog_logs}"
+-
+-xP="${xP:-1}" #-> Number of Prefill Servers
+-yD="${yD:-1}" #-> Number of Decode Servers
++# Use NFS path so all nodes can access the scripts
++NIXL_REPO_DIR="${NIXL_REPO_DIR:-/nfsdata/vllm_disagg_scripts}"
++LOG_PATH="${LOG_PATH:-/tmp/vllm_disagg_logs}"
+ 
++xP="${xP:-1}"
++yD="${yD:-1}"
+ MODEL_NAME="${MODEL_NAME:-None}"
+-MODEL_DIR="${MODEL_DIR:-"/shared_inference/models_blog/"}"
++MODEL_DIR="${MODEL_DIR:-/nfsdata/hf_hub_cache-0}"
+ 
+ validate_model_name() {
+-  local is_valid_model=false
+-
+-  for model in "${VALID_MODELS[@]}"; do
+-    if [[ "$MODEL_NAME" == "$model" ]]; then
+-      is_valid_model=true
+-      break
+-    fi
+-  done
+-
+-  if ! $is_valid_model; then
+-    printf "Error: Invalid MODEL_NAME: '%s'\nValid models are:\n" "$MODEL_NAME"
+     for model in "${VALID_MODELS[@]}"; do
+-      printf "  - %s\n" "$model"
++        [[ "$MODEL_NAME" == "$model" ]] && return 0
+     done
++    printf "Error: Invalid MODEL_NAME: '%s'\nValid models:\n" "$MODEL_NAME"
++    for model in "${VALID_MODELS[@]}"; do printf "  - %s\n" "$model"; done
+     exit 1
+-  fi
+-
+-  echo "MODEL_NAME '$MODEL_NAME' is valid."
+-  return 0
+ }
+-
+-validate_model_name "${MODEL_NAME}"
+-
++validate_model_name
+ 
+ # ------------------------
+-# Model path validation and selection across all nodes
++# Model path resolution
+ # ------------------------
+-ORIGINAL_MODEL_PATH="/shared_inference/models_blog/${MODEL_NAME}"
+-
+-echo "Looking for model: $MODEL_NAME"
+-echo "Checking model availability across all allocated nodes..."
+-
+-# Get all allocated nodes
+-ALL_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+-TOTAL_NODES=$(echo "$ALL_NODES" | wc -l)
+-
+-echo "Total allocated nodes: $TOTAL_NODES"
+-echo "Nodes: $(echo "$ALL_NODES" | tr '\n' ' ')"
+-
+-# Function to check model path on all nodes
+-check_model_path() {
+-    local path=$1
+-    local check_name=$2
+-
+-    echo "Checking $check_name: $path"
+-
+-    # Run check on all nodes in parallel
+-    srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES /bin/bash -c "
+-        if [ -d '$path' ]; then
+-            echo \"\$(hostname): ✓ Found $path\"
+-            exit 0
+-        else
+-            echo \"\$(hostname): ✗ Missing $path\"
+-            exit 1
++DISK_DIR_NAME="${MODEL_DIR_NAMES[$MODEL_NAME]:-$MODEL_NAME}"
++echo "Looking for model: $MODEL_NAME (disk dir: $DISK_DIR_NAME)"
++
++# Resolve HF cache snapshot path
++resolve_hf_cache_path() {
++    local base_path=$1
++    if [[ -d "${base_path}/snapshots" ]]; then
++        local snapshot=$(ls -1 "${base_path}/snapshots" 2>/dev/null | head -1)
++        if [[ -n "$snapshot" ]]; then
++            echo "${base_path}/snapshots/${snapshot}"
++            return 0
+         fi
+-    "
+-
+-    # Check if all nodes succeeded (exit code 0)
+-    local exit_code=$?
+-    if [ $exit_code -eq 0 ]; then
+-        echo "✓ $check_name available on ALL nodes"
+-        return 0
+-    else
+-        echo "✗ $check_name NOT available on all nodes"
+-        return 1
+     fi
++    echo "$base_path"
++    return 1
+ }
+ 
+-# Check /mnt/m2m_nobackup/models_blog first
+-MODEL_PATH_1="/mnt/m2m_nobackup/models_blog/$MODEL_NAME"
+-if check_model_path "$MODEL_PATH_1" "/mnt/m2m_nobackup/models_blog"; then
+-    MODEL_PATH="$MODEL_PATH_1"
+-    echo ""
+-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
+-# Check /shared-inference/models_blog
+-elif check_model_path "/shared_inference/models_blog/$MODEL_NAME" "/shared_inference/models_blog"; then
+-    MODEL_PATH="/shared_inference/models_blog/$MODEL_NAME"
+-    echo ""
+-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
+-elif check_model_path "$MODEL_DIR/$MODEL_NAME" "$MODEL_DIR"; then
+-    MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
+-    echo ""
+-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
+-else
+-    echo ""
+-    echo "✗ FATAL ERROR: Model '$MODEL_NAME' not found on ALL allocated nodes in either:"
+-    echo "  - /mnt/m2m_nobackup/models_blog/$MODEL_NAME"
+-    echo "  - /shared_inference/models_blog/$MODEL_NAME"
+-    echo ""
+-    echo "Model must be accessible from all nodes for distributed execution."
+-    echo "Please ensure the model is available on all allocated nodes."
++MODEL_PATH=""
++SEARCH_PATHS=(
++    "/nfsdata/hf_hub_cache-0/${DISK_DIR_NAME}"
++    "/mnt/m2m_nobackup/models_blog/${DISK_DIR_NAME}"
++    "/shared_inference/models_blog/${DISK_DIR_NAME}"
++    "${MODEL_DIR}/${DISK_DIR_NAME}"
++    "/nfsdata/hf_hub_cache-0/${MODEL_NAME}"
++    "/shared_inference/models_blog/${MODEL_NAME}"
++    "${MODEL_DIR}/${MODEL_NAME}"
++)
++
++for search_path in "${SEARCH_PATHS[@]}"; do
++    if [[ -d "$search_path" ]]; then
++        RESOLVED=$(resolve_hf_cache_path "$search_path")
++        MODEL_PATH="$RESOLVED"
++        echo "✓ Found MODEL_PATH: $MODEL_PATH"
++        break
++    fi
++done
++
++if [[ -z "$MODEL_PATH" ]]; then
++    echo "FATAL: Model '$MODEL_NAME' not found. Searched:"
++    for p in "${SEARCH_PATHS[@]}"; do echo "  - $p"; done
+     exit 1
+ fi
+-
+ echo "Final MODEL_PATH: $MODEL_PATH"
+-echo ""
+-
+ 
+-# Calculate NUM_NODES based on xP and yD
++# Calculate NUM_NODES
+ NUM_NODES=$((xP + yD + 1))
+-echo "Calculated NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD + 1)"
+-echo "Calculated NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD + 1)"
++echo "NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD + 1)"
+ 
+ # ------------------------
+-# Extract first NUM_NODES from SLURM allocation and update SLURM variables
++# Node selection from SLURM allocation
+ # ------------------------
+-echo "Original SLURM allocation:"
+-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+-echo "SLURM_NNODES: $SLURM_NNODES"
+-echo "SLURM_NTASKS: $SLURM_NTASKS"
+-
+-# Get the full nodelist and extract first NUM_NODES
+ FULL_NODELIST=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+ SELECTED_NODES=$(echo "$FULL_NODELIST" | head -n $NUM_NODES)
+-SELECTED_NODELIST_STR=$(echo "$SELECTED_NODES" | tr '\n' ',' | sed 's/,$//')
+-
+-# Create new nodelist in SLURM format
+-# This is a simplified approach - for complex ranges, you might need more sophisticated parsing
+-NEW_SLURM_NODELIST=$(echo "$SELECTED_NODES" | paste -sd, | sed 's/,/,/g')
+ 
+-# Update SLURM environment variables
+ export SLURM_NNODES=$NUM_NODES
+ export SLURM_NTASKS=$NUM_NODES
+ export SLURM_JOB_NUM_NODES=$NUM_NODES
+ export SLURM_NPROCS=$NUM_NODES
++NEW_SLURM_NODELIST=$(echo "$SELECTED_NODES" | paste -sd,)
+ export SLURM_JOB_NODELIST="$NEW_SLURM_NODELIST"
+ export SLURM_NODELIST="$NEW_SLURM_NODELIST"
+-
+-# Keep other SLURM variables as they were or set defaults
+ export SLURM_TASKS_PER_NODE="1(x$NUM_NODES)"
+-
+-export SLURM_CLUSTER_NAME="${SLURM_CLUSTER_NAME}"
+-export SLURM_JOB_CPUS_PER_NODE="${SLURM_JOB_CPUS_PER_NODE}"
+-export SLURM_JOB_PARTITION="${SLURM_JOB_PARTITION}"
+-export SLURM_JOBID="${SLURM_JOBID:-$SLURM_JOB_ID}"
+-export SLURM_JOB_QOS="${SLURM_JOB_QOS:-normal}"
+-export SLURM_JOB_ACCOUNT="${SLURM_JOB_ACCOUNT}"
+ export SLURM_NTASKS_PER_NODE=1
+-export SLURM_SUBMIT_HOST="${SLURM_SUBMIT_HOST}"
+-export SLURM_JOB_ID="${SLURM_JOB_ID}"
+-export SLURM_CONF="${SLURM_CONF:-/etc/slurm/slurm.conf}"
+-export SLURM_JOB_NAME="${SLURM_JOB_NAME:-1p1d_bench-serving}"
+-
+-echo ""
+-echo "Updated SLURM Environment Variables:"
+-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+-echo "SLURM_NNODES: $SLURM_NNODES"
+-echo "SLURM_NTASKS: $SLURM_NTASKS"
+-echo "SLURM_TASKS_PER_NODE: $SLURM_TASKS_PER_NODE"
+-echo "SLURM_JOB_CPUS_PER_NODE: $SLURM_JOB_CPUS_PER_NODE"
+-echo "SLURM_JOB_PARTITION: $SLURM_JOB_PARTITION"
+-echo "SLURM_JOB_NUM_NODES: $SLURM_JOB_NUM_NODES"
+-echo "SLURM_JOBID: $SLURM_JOBID"
+-echo "SLURM_JOB_QOS: $SLURM_JOB_QOS"
+-echo "SLURM_NODELIST: $SLURM_NODELIST"
+-echo "SLURM_JOB_ACCOUNT: $SLURM_JOB_ACCOUNT"
+-echo "SLURM_NPROCS: $SLURM_NPROCS"
+-echo "SLURM_SUBMIT_HOST: $SLURM_SUBMIT_HOST"
+-echo "SLURM_CONF: $SLURM_CONF"
+-echo "SLURM_JOB_NAME: $SLURM_JOB_NAME"
+-echo "SLURM_NTASKS_PER_NODE: $SLURM_NTASKS_PER_NODE"
+-#echo "SLURM_SUBMIT_DIR: $SLURM_SUBMIT_DIR"
+-echo "SLURM_CLUSTER_NAME: $SLURM_CLUSTER_NAME"
+-echo "ulimit: $(ulimit -a)"
+-echo ""
+-echo "Selected nodes for execution:"
+-echo "$SELECTED_NODES"
+-echo ""
+-
+-# MAke sure xP*8 and yD*8 are multiple of by 129280 for Deepseek V3
+ 
+-# ------------------------
+-# SLURM Environment Variables
+-# ------------------------
+-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
+-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+-echo "SLURM_NNODES: $SLURM_NNODES"
+-echo "SLURM_NTASKS: $SLURM_NTASKS"
+-echo "SLURM_TASKS_PER_NODE: $SLURM_TASKS_PER_NODE"
+-echo "SLURM_JOB_CPUS_PER_NODE: $SLURM_JOB_CPUS_PER_NODE"
+-echo "ulimit: $(ulimit -a)"
+-echo ""
++echo "Selected nodes: $NEW_SLURM_NODELIST"
+ 
+-# Node information
++# Resolve IPs
+ USER_NAME=$(whoami)
+ MASTER_NODE=$(echo "$SELECTED_NODES" | head -n 1)
+-MASTER_ADDR=$(srun --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$MASTER_NODE" bash -c 'hostname -I')
+-MASTER_ADDR=$(echo "$MASTER_ADDR" | awk 'NR==1 {print $1}')
+-MASTER_PORT=39566  # Choose an open port
++# Use default route source IP (management network) for inter-node TCP communication
++MASTER_ADDR=$(srun --chdir=/tmp --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$MASTER_NODE" bash -c 'ip route get 1.1.1.1 | sed -n "s/.*src \([^ ]*\).*/\1/p"')
++MASTER_ADDR=$(echo "$MASTER_ADDR" | head -1 | tr -d '[:space:]')
++MASTER_PORT=39566
+ 
+ IPS=()
+-
+ for NODE in $SELECTED_NODES; do
+-    IP=$(srun --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$NODE" bash -c 'hostname -I')
+-    IP=$(echo "$IP" | awk 'NR==1 {print $1}')
++    IP=$(srun --chdir=/tmp --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$NODE" bash -c 'ip route get 1.1.1.1 | sed -n "s/.*src \([^ ]*\).*/\1/p"')
++    IP=$(echo "$IP" | head -1 | tr -d '[:space:]')
+     IPS+=("$IP")
+ done
+ 
+-echo "Selected node IPs: ${IPS[*]}" | sed 's/ /,/g'
++echo "Node IPs: ${IPS[*]}"
+ 
+ NIXL_COOKBOOK_PATH="/opt/nixl-vllm-cookbook"
+-BENCHMARK_FILE="${BENCHMARK_FILE:-$NIXL_COOKBOOK_PATH/dissag_blog_p1/models_blog/run_xPyD_models.slurm}"
+-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+-
+ NNODES=$NUM_NODES
+ 
+-echo "MASTER_NODE is ${MASTER_NODE}"
+-echo "MASTER_ADDR is ${MASTER_ADDR}"
+-echo "MASTER_PORT is ${MASTER_PORT}"
+-echo "NNODES is ${NNODES}"
+-echo "REPO Directory is ${MOONCAKE_REPO_DIR}"
++echo "MASTER_NODE=$MASTER_NODE  MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
+ 
+-if [ ! -d "$LOG_PATH" ]; then
+-    mkdir -p "$LOG_PATH"
+-    echo "Created directory: $LOG_PATH"
+-else
+-    echo "Directory already exists: $LOG_PATH"
+-fi
++mkdir -p "$LOG_PATH"
+ 
+-export LOG_PATH=$LOG_PATH
+-export NIXL_REPO_DIR=$NIXL_REPO_DIR
+-export NIXL_COOKBOOK_PATH=$NIXL_COOKBOOK_PATH
+-export NNODES=$NNODES
+-export MASTER_ADDR=$MASTER_ADDR
+-export MASTER_PORT=$MASTER_PORT
+-export MODEL_PATH=$MODEL_PATH
+-export xP=$xP
+-export yD=$yD
+-export MODEL_NAME=$MODEL_NAME
+-export USER_NAME=$USER_NAME
++export LOG_PATH NIXL_REPO_DIR NIXL_COOKBOOK_PATH NNODES MASTER_ADDR MASTER_PORT MODEL_PATH
++export xP yD MODEL_NAME USER_NAME
+ export IPADDRS="$(echo "${IPS[*]}" | sed 's/ /,/g')"
+-
+ export DOCKER_CONT_NAME="container_${MODEL_NAME}_${SLURM_JOB_ID}"
+ export RUN_FILE_FULL="$NIXL_COOKBOOK_PATH/${RUN_FILE}"
+ 
+-# Use only the selected nodes for srun execution
+ SELECTED_NODELIST_SRUN=$(echo "$SELECTED_NODES" | paste -sd,)
+ 
+-srun --nodelist="$SELECTED_NODELIST_SRUN" bash -c '
++srun --chdir=/tmp --nodelist="$SELECTED_NODELIST_SRUN" bash -c '
+ echo "Rank $SLURM_PROCID on $(hostname)";
+-docker ps -q | xargs --no-run-if-empty docker stop;
+-docker run --rm \
++sudo docker ps -q | xargs --no-run-if-empty sudo docker stop;
++sudo docker run --rm \
+     --device /dev/dri \
+     --device /dev/kfd \
+     --device /dev/infiniband \
+@@ -317,6 +183,7 @@ docker run --rm \
+     --security-opt seccomp=unconfined \
+     --privileged \
+     -v $HOME:$HOME \
++    -v /nfsdata:/nfsdata \
+     -v /shared_inference:/shared_inference \
+     -v /mnt/m2m_nobackup:/mnt/m2m_nobackup \
+     -v $HOME/.ssh:/root/.ssh \
+@@ -336,16 +203,23 @@ docker run --rm \
+     -e yD=$yD \
+     -e USER_NAME=$USER_NAME \
+     -e MODEL_NAME=$MODEL_NAME \
+-    -e BENCHMARK_FILE=$BENCHMARK_FILE \
+     -e IPADDRS=$IPADDRS \
+     -e PROXY_TYPE=${PROXY_TYPE:-vllm_router} \
+     -e ROUTER_PORT=${ROUTER_PORT:-2584} \
+     -e BENCHMARK_PORT=${BENCHMARK_PORT:-2584} \
++    -e DRY_RUN=${DRY_RUN:-0} \
++    -e UCX_TLS=all \
++    -e UCX_SOCKADDR_TLS_PRIORITY=tcp \
++    -e UCX_MEMTYPE_CACHE=y \
++    -e UCX_RNDV_SCHEME=get_zcopy \
++    -e UCX_RNDV_THRESH=4k \
++    -e UCX_ROCM_IPC_MIN_ZCOPY=0 \
++    -e UCX_LOG_LEVEL=info \
++    -e HSA_ENABLE_SDMA=1 \
+     --name $DOCKER_CONT_NAME \
+     $DOCKER_IMAGE_NAME bash -c "
+         mkdir -p /run_logs/${SLURM_JOB_ID}
+         $RUN_FILE_FULL 2>&1 | tee /run_logs/${SLURM_JOB_ID}/pd_vllm_bench_NODE${SLURM_PROCID}.log
+     "
+ '
+-srun --nodelist="$SELECTED_NODELIST_SRUN" bash -c 'docker stop $DOCKER_CONT_NAME; docker rm $DOCKER_CONT_NAME'
+-
++srun --chdir=/tmp --nodelist="$SELECTED_NODELIST_SRUN" bash -c 'sudo docker stop $DOCKER_CONT_NAME 2>/dev/null; sudo docker rm $DOCKER_CONT_NAME 2>/dev/null'
+diff --git a/scripts/vllm_dissag/salloc_launch.sh b/scripts/vllm_dissag/salloc_launch.sh
+deleted file mode 100755
+index b845db1..0000000
+--- a/scripts/vllm_dissag/salloc_launch.sh
++++ /dev/null
+@@ -1,14 +0,0 @@
+-#!/bin/bash
+-
+-# Before running this code - request 5 nodes from salloc 
+-#salloc -N 5 --ntasks-per-node=1 --nodelist=<Nodes> --gres=gpu:8 -p <partition> -t 12:00:00
+-#Sample Commands
+-export xP=2; export yD=2; export MODEL_NAME=Llama-3.1-405B-Instruct-FP8-KV;      bash run_xPyD_models.slurm 2>&1 | tee log_${MODEL_NAME}_xP${xP}_yD${yD}.log
+-export xP=1; export yD=1; export MODEL_NAME=amd-Llama-3.3-70B-Instruct-FP8-KV;   bash run_xPyD_models.slurm 2>&1 | tee log_${MODEL_NAME}_xP${xP}_yD${yD}.log
+-export xP=2; export yD=2; export MODEL_NAME=DeepSeek-V3;   bash run_xPyD_models.slurm 2>&1 | tee log_${MODEL_NAME}_xP${xP}_yD${yD}.log
+-
+-
+-#Or directly run with sbatch command
+-#export DOCKER_IMAGE_NAME=<DOCKER IMAGE NAME>
+-#export xP=<num_prefill_nodes>; export yD=<num_decode_nodes>; export MODEL_NAME=Llama-3.1-8B-Instruct; sbatch -N <num_nodes> -n <num_nodes> --nodelist=<Nodes> run_xPyD_models.slurm
+-
+diff --git a/scripts/vllm_dissag/socket_barrier.py b/scripts/vllm_dissag/socket_barrier.py
+old mode 100644
+new mode 100755
+diff --git a/scripts/vllm_dissag/socket_wait.py b/scripts/vllm_dissag/socket_wait.py
+old mode 100644
+new mode 100755
+diff --git a/scripts/vllm_dissag/start_etcd.sh b/scripts/vllm_dissag/start_etcd.sh
+index 7eed9aa..88627cc 100755
+--- a/scripts/vllm_dissag/start_etcd.sh
++++ b/scripts/vllm_dissag/start_etcd.sh
+@@ -1,15 +1,17 @@
+ #!/bin/bash
+ set -x
+-# Define the full list of cluster IPs
++
+ IPADDRS="${IPADDRS:-localhost}"
+ 
+-# Automatically detect this host's IP (assuming it's the IP on the correct network)
+-host_ip=$(hostname -I | awk '{print $1}')
++# Use management network IP (matching what the Slurm script resolved)
++host_ip=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p')
++if [[ -z "$host_ip" ]]; then
++    host_ip=$(hostname -I | awk '{print $1}')
++fi
+ 
+-# Convert comma-separated IP list into an array
+ IFS=',' read -ra ADDR <<< "$IPADDRS"
+ 
+-# Determine node name based on position in list
++# Determine node name based on position in the IPADDRS list
+ index=0
+ for ip in "${ADDR[@]}"; do
+   if [[ "$ip" == "$host_ip" ]]; then
+@@ -29,13 +31,10 @@ for i in "${!ADDR[@]}"; do
+   fi
+ done
+ 
+-# Prepare etcd data directory
+ mkdir -p /var/lib/etcd
+-
+ rm -rf /var/lib/etcd/*
+ 
+-# Run etcd with full config
+-/usr/local/bin/etcd//etcd \
++/usr/local/bin/etcd/etcd \
+   --name "$node_name" \
+   --data-dir /var/lib/etcd \
+   --initial-advertise-peer-urls http://$host_ip:2380 \
+diff --git a/scripts/vllm_dissag/sync.py b/scripts/vllm_dissag/sync.py
+new file mode 100755
+index 0000000..757eb0d
+--- /dev/null
++++ b/scripts/vllm_dissag/sync.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++"""
++Multi-node synchronization utilities for disaggregated inference.
++
++Subcommands:
++    barrier  - Wait until all specified nodes have opened their ports (TCP barrier)
++               Optionally wait for HTTP health endpoints to return 200
++    wait     - Block until a remote port closes (shutdown coordination)
++"""
++
++import socket
++import time
++import threading
++import argparse
++import sys
++import urllib.request
++import urllib.error
++
++
++def is_port_open(ip, port, timeout=2):
++    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
++        s.settimeout(timeout)
++        return s.connect_ex((ip, port)) == 0
++
++
++def check_health(ip, port, path="/health", timeout=2):
++    try:
++        url = f"http://{ip}:{port}{path}"
++        req = urllib.request.Request(url)
++        with urllib.request.urlopen(req, timeout=timeout) as resp:
++            return getattr(resp, "status", 200) == 200
++    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
++        return False
++
++
++def cmd_barrier(args):
++    NODE_IPS = [ip.strip() for ip in args.node_ips.split(",") if ip.strip()]
++    NODE_PORTS = [int(p.strip()) for p in args.node_ports.split(",") if p.strip()]
++
++    if not NODE_IPS:
++        print("Error: NODE_IPS argument is empty or not set.")
++        sys.exit(1)
++
++    if len(NODE_PORTS) == 1:
++        NODE_PORTS *= len(NODE_IPS)
++    elif len(NODE_PORTS) != len(NODE_IPS):
++        print("Error: Number of ports must match number of node IPs or be a single port.")
++        sys.exit(1)
++
++    server_socket = None
++
++    def open_port():
++        nonlocal server_socket
++        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        server_socket.bind((args.local_ip, args.local_port))
++        server_socket.listen(5)
++        print(f"Port {args.local_port} is now open on {args.local_ip}.")
++        while True:
++            conn, _ = server_socket.accept()
++            conn.close()
++
++    def close_port():
++        nonlocal server_socket
++        if server_socket:
++            server_socket.close()
++            print(f"Port {args.local_port} has been closed on {args.local_ip}.")
++
++    if args.enable_port:
++        threading.Thread(target=open_port, daemon=True).start()
++
++    if args.wait_for_all_ports:
++        start_time = time.time()
++        timeout = args.timeout
++        while True:
++            if timeout > 0:
++                elapsed = time.time() - start_time
++                if elapsed >= timeout:
++                    not_open = [(ip, port) for ip, port in zip(NODE_IPS, NODE_PORTS)
++                                if not is_port_open(ip, port)]
++                    print(f"ERROR: Timeout after {timeout}s waiting for ports.", flush=True)
++                    for ip, port in not_open:
++                        print(f"  - {ip}:{port}", flush=True)
++                    sys.exit(1)
++            all_open = all(is_port_open(ip, port) for ip, port in zip(NODE_IPS, NODE_PORTS))
++            if all_open:
++                break
++            if timeout > 0:
++                remaining = timeout - (time.time() - start_time)
++                print(f"Waiting for nodes {list(zip(NODE_IPS, NODE_PORTS))} .. ({remaining:.0f}s remaining)", flush=True)
++            else:
++                print(f"Waiting for nodes {list(zip(NODE_IPS, NODE_PORTS))} ..", flush=True)
++            time.sleep(5)
++
++    if args.wait_for_all_health:
++        health_path = args.health_endpoint
++        start_time = time.time()
++        timeout = args.timeout
++        while True:
++            if timeout > 0:
++                elapsed = time.time() - start_time
++                if elapsed >= timeout:
++                    not_ready = [(ip, port) for ip, port in zip(NODE_IPS, NODE_PORTS)
++                                 if not check_health(ip, port, health_path)]
++                    print(f"ERROR: Timeout after {timeout}s waiting for health endpoints.", flush=True)
++                    for ip, port in not_ready:
++                        print(f"  - http://{ip}:{port}{health_path}", flush=True)
++                    sys.exit(1)
++            all_ready = all(check_health(ip, port, health_path) for ip, port in zip(NODE_IPS, NODE_PORTS))
++            if all_ready:
++                break
++            if timeout > 0:
++                remaining = timeout - (time.time() - start_time)
++                print(f"Waiting for health on {list(zip(NODE_IPS, NODE_PORTS))} ({health_path}) .. ({remaining:.0f}s remaining)", flush=True)
++            else:
++                print(f"Waiting for health on {list(zip(NODE_IPS, NODE_PORTS))} ({health_path}) ..", flush=True)
++            time.sleep(30)
++
++    if args.enable_port:
++        time.sleep(30)
++        close_port()
++
++
++def cmd_wait(args):
++    print(f"Waiting while port {args.remote_port} on {args.remote_ip} is open...")
++    while is_port_open(args.remote_ip, args.remote_port):
++        time.sleep(5)
++    print(f"Port {args.remote_port} on {args.remote_ip} is now closed.")
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Multi-node synchronization utilities.")
++    subparsers = parser.add_subparsers(dest="command", required=True)
++
++    bp = subparsers.add_parser("barrier", help="Wait for all nodes to open specified ports.")
++    bp.add_argument("--local-ip", required=False)
++    bp.add_argument("--local-port", type=int, required=False)
++    bp.add_argument("--enable-port", action="store_true")
++    bp.add_argument("--node-ips", required=True, help="Comma-separated list of node IPs.")
++    bp.add_argument("--node-ports", required=True, help="Comma-separated list of ports to check.")
++    bp.add_argument("--timeout", type=int, default=600)
++    bp.add_argument("--wait-for-all-ports", action="store_true")
++    bp.add_argument("--wait-for-all-health", action="store_true")
++    bp.add_argument("--health-endpoint", default="/health")
++    bp.set_defaults(func=cmd_barrier)
++
++    wp = subparsers.add_parser("wait", help="Wait while a remote port remains open.")
++    wp.add_argument("--remote-ip", required=True)
++    wp.add_argument("--remote-port", type=int, required=True)
++    wp.set_defaults(func=cmd_wait)
++
++    args = parser.parse_args()
++    args.func(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/vllm_dissag/vllm_disagg_server.sh b/scripts/vllm_dissag/vllm_disagg_server.sh
+index 82bc773..bf9e303 100755
+--- a/scripts/vllm_dissag/vllm_disagg_server.sh
++++ b/scripts/vllm_dissag/vllm_disagg_server.sh
+@@ -1,6 +1,11 @@
+ #!/bin/bash
+-# VLLM Disaggregated Server Launcher with Model-Specific Configurations
++# vLLM Disaggregated Server Launcher with Model-Specific Configurations
+ # =============================================================================
++#
++# Node role assignment (by NODE_RANK):
++#   0            -> Proxy/Router node
++#   1..xP        -> Prefill nodes  (kv_producer)
++#   xP+1..xP+yD -> Decode nodes   (kv_consumer)
+ 
+ # =============================================================================
+ # Environment Configuration
+@@ -14,8 +19,8 @@ MODEL_NAME="${MODEL_NAME:-}"
+ xP="${xP:-1}"
+ yD="${yD:-1}"
+ IPADDRS="${IPADDRS:-localhost}"
++DRY_RUN="${DRY_RUN:-0}"
+ 
+-# Proxy configuration: "vllm_router" (default) or "toy_proxy"
+ PROXY_TYPE="${PROXY_TYPE:-vllm_router}"
+ ROUTER_PORT="${ROUTER_PORT:-2584}"
+ 
+@@ -34,12 +39,32 @@ ls ${NIXL_COOKBOOK_PATH}
+ pip install py-spy
+ pip install --ignore-installed --force-reinstall flask
+ 
+-#trap 'echo "Error occurred. Cleaning up..."; exit 0' ERR
++# Patch Nixl UCX backend: set ucx_error_handling_mode=none for shared-memory
++# transport compatibility (Pensando ionic NICs don't support rdmacm, so the
++# default UCP_ERR_HANDLING_MODE_PEER causes "no active messages transport" errors)
++NIXL_API_FILE=$(python3 -c "import rixl._api; print(rixl._api.__file__)" 2>/dev/null)
++if [[ -n "$NIXL_API_FILE" ]]; then
++    if ! grep -q 'ucx_error_handling_mode' "$NIXL_API_FILE"; then
++        sed -i '/init\["num_threads"\] = str(nixl_conf.num_threads)/a\                        init["ucx_error_handling_mode"] = "none"' "$NIXL_API_FILE"
++        echo "[PATCH] Added ucx_error_handling_mode=none to $NIXL_API_FILE"
++    else
++        echo "[PATCH] ucx_error_handling_mode already set in $NIXL_API_FILE"
++    fi
++fi
+ 
+-host_ip=$(hostname -I | awk '{print $1}')
++source ${NIXL_COOKBOOK_PATH}/env.sh
++
++# Management IP: use default route source (most reliable across clusters)
++host_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7}')
++# RDMA IP: first 192.168.x IP for Nixl KV transfer
++rdma_ip=$(hostname -I | tr ' ' '\n' | grep '^192\.168\.' | head -1)
++rdma_ip="${rdma_ip:-$host_ip}"
+ host_name=$(hostname)
+ SERVER_PORT=2584
+ 
++echo "[INFO] Management IP (barriers/proxy): $host_ip"
++echo "[INFO] RDMA IP (Nixl KV transfer): $rdma_ip"
++
+ if [ "$PROXY_TYPE" == "vllm_router" ]; then
+     PROXY_PORT=$ROUTER_PORT
+ else
+@@ -47,12 +72,12 @@ else
+ fi
+ 
+ if [[ -z "$UCX_NET_DEVICES" ]]; then
+-    echo "Error: UCX_NET_DEVICES is empty" >&2
++    echo "Error: UCX_NET_DEVICES is empty after env.sh detection" >&2
+     exit 1
+ fi
+ 
+ if [[ -z "$NCCL_SOCKET_IFNAME" ]]; then
+-    echo "Error: NCCL_SOCKET_IFNAME is empty" >&2
++    echo "Error: NCCL_SOCKET_IFNAME is empty after env.sh detection" >&2
+     exit 1
+ fi
+ 
+@@ -63,14 +88,16 @@ fi
+ declare -A MODEL_PREFILL_CONFIGS=(
+     ["Llama-3.1-405B-Instruct-FP8-KV"]="--tensor-parallel-size 8 --kv-cache-dtype fp8"
+     ["amd-Llama-3.3-70B-Instruct-FP8-KV"]="--tensor-parallel-size 8 --max-model-len 65536 --kv-cache-dtype fp8"
+-    ["DeepSeek-V3"]="--tensor-parallel-size 8 --compilation-config '{\"full_cuda_graph\": false, \"cudagraph_mode\":\"PIECEWISE\"}' --no-enable-prefix-caching --block-size 1"
++    ["DeepSeek-V3"]="--tensor-parallel-size 8 --compilation-config '{\"cudagraph_mode\":\"PIECEWISE\"}' --no-enable-prefix-caching --block-size 1"
++    ["DeepSeek-R1-0528"]="--tensor-parallel-size 8 --compilation-config '{\"cudagraph_mode\":\"PIECEWISE\"}' --no-enable-prefix-caching --block-size 1"
+     ["gpt-oss-120b"]="--tensor-parallel-size 8"
+ )
+ 
+ declare -A MODEL_DECODE_CONFIGS=(
+     ["Llama-3.1-405B-Instruct-FP8-KV"]="--tensor-parallel-size 8 --kv-cache-dtype fp8"
+     ["amd-Llama-3.3-70B-Instruct-FP8-KV"]="--tensor-parallel-size 8 --max-model-len 65536 --kv-cache-dtype fp8"
+-    ["DeepSeek-V3"]="--tensor-parallel-size 8 --compilation-config '{\"full_cuda_graph\": false, \"cudagraph_mode\":\"PIECEWISE\"}' --no-enable-prefix-caching --block-size 1"
++    ["DeepSeek-V3"]="--tensor-parallel-size 8 --compilation-config '{\"cudagraph_mode\":\"PIECEWISE\"}' --no-enable-prefix-caching --block-size 1"
++    ["DeepSeek-R1-0528"]="--tensor-parallel-size 8 --compilation-config '{\"cudagraph_mode\":\"PIECEWISE\"}' --no-enable-prefix-caching --block-size 1"
+     ["gpt-oss-120b"]="--tensor-parallel-size 8"
+ )
+ 
+@@ -78,6 +105,7 @@ declare -A MODEL_ENVS=(
+     ["amd-Llama-3.3-70B-Instruct-FP8-KV"]="VLLM_USE_V1=1 VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1 AMDGCN_USE_BUFFER_OPS=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_RMSNORM=1 VLLM_USE_AITER_TRITON_ROPE=1 TRITON_HIP_ASYNC_COPY_BYPASS_PERMUTE=1 TRITON_HIP_USE_ASYNC_COPY=1 TRITON_HIP_USE_BLOCK_PINGPONG=1 TRITON_HIP_ASYNC_FAST_SWIZZLE=1 "
+     ["Llama-3.1-405B-Instruct-FP8-KV"]="VLLM_USE_V1=1 VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1 AMDGCN_USE_BUFFER_OPS=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_RMSNORM=1 VLLM_USE_AITER_TRITON_ROPE=1 TRITON_HIP_ASYNC_COPY_BYPASS_PERMUTE=1 TRITON_HIP_USE_ASYNC_COPY=1 TRITON_HIP_USE_BLOCK_PINGPONG=1 TRITON_HIP_ASYNC_FAST_SWIZZLE=1 "
+     ["DeepSeek-V3"]="VLLM_USE_V1=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_PAGED_ATTN=0 VLLM_ROCM_USE_AITER_RMSNORM=1 VLLM_USE_AITER_TRITON_SILU_MUL=0 "
++    ["DeepSeek-R1-0528"]="VLLM_USE_V1=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_PAGED_ATTN=0 VLLM_ROCM_USE_AITER_RMSNORM=1 VLLM_USE_AITER_TRITON_SILU_MUL=0 "
+     ["gpt-oss-120b"]="VLLM_USE_V1=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM=0 VLLM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_AITER_MHA=0 ROCM_TRITON_MOE_PRESHUFFLE_SCALES=0 "
+ )
+ 
+@@ -88,89 +116,73 @@ declare -A MODEL_ENVS=(
+ get_model_config() {
+     local mode="$1"
+     local model_name="$2"
+-    
+     if [[ "$mode" == "prefill" ]]; then
+-        if [[ -n "${MODEL_PREFILL_CONFIGS[$model_name]}" ]]; then
+-            echo "${MODEL_PREFILL_CONFIGS[$model_name]}"
+-        else
+-            echo "--tp-size 4"
+-        fi
++        echo "${MODEL_PREFILL_CONFIGS[$model_name]:-"--tp-size 4"}"
+     elif [[ "$mode" == "decode" ]]; then
+-        if [[ -n "${MODEL_DECODE_CONFIGS[$model_name]}" ]]; then
+-            echo "${MODEL_DECODE_CONFIGS[$model_name]}"
+-        else
+-            echo "--tp-size 4"
+-        fi
++        echo "${MODEL_DECODE_CONFIGS[$model_name]:-"--tp-size 4"}"
+     fi
+ }
+ 
+ get_model_envs() {
+-    local model_name="$1"
+-    
+-    if [[ -n "${MODEL_ENVS[$model_name]}" ]]; then
+-        echo "${MODEL_ENVS[$model_name]}"
+-    else
+-        echo ""
+-    fi
++    echo "${MODEL_ENVS[$1]:-""}"
+ }
+ 
+ if [[ -z "$MODEL_NAME" ]]; then
+-    echo "Warning: MODEL_NAME not set, using default configurations"
+-    echo "ERROR: please set MODEL_NAME"
+-    exit 0
+-else
+-    PREFILL_MODEL_CONFIG=$(get_model_config "prefill" "$MODEL_NAME")
+-    DECODE_MODEL_CONFIG=$(get_model_config "decode" "$MODEL_NAME")
+-    PREFILL_MODEL_ENVS=$(get_model_envs "$MODEL_NAME")
+-    DECODE_MODEL_ENVS=$(get_model_envs "$MODEL_NAME")
+-    echo "Using model-specific configuration for: $MODEL_NAME"
++    echo "ERROR: MODEL_NAME is not set"; exit 1
+ fi
+ 
++PREFILL_MODEL_CONFIG=$(get_model_config "prefill" "$MODEL_NAME")
++DECODE_MODEL_CONFIG=$(get_model_config "decode" "$MODEL_NAME")
++PREFILL_MODEL_ENVS=$(get_model_envs "$MODEL_NAME")
++DECODE_MODEL_ENVS=$(get_model_envs "$MODEL_NAME")
++echo "Using model-specific configuration for: $MODEL_NAME"
++
++ENGINE_ID="${ENGINE_ID:-${MODEL_NAME}-pd-run}"
++
+ # =============================================================================
+ # Container Synchronization
+ # =============================================================================
+ 
+ echo "Waiting at the container creation barrier on $host_name"
+-python $NIXL_COOKBOOK_PATH/socket_barrier.py \
++python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
+     --local-ip ${host_ip} \
+     --local-port 5000 \
+     --enable-port \
+     --node-ips ${IPADDRS} \
+-    --node-ports 5000
++    --node-ports 5000 \
++    --wait-for-all-ports \
++    --timeout 300
+ 
+ # =============================================================================
+ # ETCD Server Setup
+ # =============================================================================
+ 
+ echo "Proceeding to start etcd server on $host_name"
+-
+ ${NIXL_COOKBOOK_PATH}/start_etcd.sh > /dev/null &
+ etcd_pid=$!
+ 
+ echo "Waiting at etcd server barrier on $host_name"
+-python $NIXL_COOKBOOK_PATH/socket_barrier.py \
++python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
+     --node-ips ${IPADDRS} \
+-    --node-ports 2379
++    --node-ports 2379 \
++    --wait-for-all-ports \
++    --timeout 300
+ 
+ echo "All etcd servers are up : $host_name"
+ sleep 3
+ 
+ echo "etcd endpoint health=================="
+-/usr/local/bin/etcd//etcdctl endpoint health
++etcdctl endpoint health 2>&1 || /usr/local/bin/etcd/etcdctl endpoint health 2>&1 || true
+ echo "======================================"
+-
+ echo "etcd member list======================"
+-/usr/local/bin/etcd//etcdctl member list
+-echo "======================================"
+-
+-echo "etcd status======================"
+-/usr/local/bin/etcd//etcdctl endpoint status --write-out=table
++etcdctl member list 2>&1 || /usr/local/bin/etcd/etcdctl member list 2>&1 || true
+ echo "======================================"
+ 
+-
+-echo "Waiting at etcd server barrier on $host_name"
+-python $NIXL_COOKBOOK_PATH/socket_barrier.py --node-ips ${IPADDRS} --node-ports 2379
+-# END SECTION===========================================================================
++python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
++    --node-ips ${IPADDRS} \
++    --node-ports 2379 \
++    --wait-for-all-ports \
++    --timeout 300
+ 
+ # =============================================================================
+ # Cluster Topology Configuration
+@@ -182,13 +194,11 @@ DECODE_ARGS=""
+ PREFILL_PORTS=""
+ DECODE_PORTS=""
+ 
+-# Loop through for `--prefill` (IPs from index 0 to N-1)
+ for ((i=1; i<=$xP && i<${#IP_ARRAY[@]}; i++)); do
+     PREFILL_ARGS+="${IP_ARRAY[$i]} "
+     PREFILL_PORTS+="$SERVER_PORT "
+ done
+ 
+-# Loop through for `--decode` (IPs from N onward)
+ for ((i=xP+1; i<${#IP_ARRAY[@]}; i++)); do
+     DECODE_ARGS+="${IP_ARRAY[$i]} "
+     DECODE_PORTS+="$SERVER_PORT "
+@@ -200,43 +210,37 @@ done
+ 
+ if [ "$NODE_RANK" -eq 0 ]; then
+     echo "NODE INFO ======================================="
+-    echo "================================================"
+-    echo "Node List : ${SLURM_JOB_NODELIST}"
+     echo "Node IPs : ${IPADDRS}"
+-    echo "Model Name : ${MODEL_NAME:-'Not specified'}"
+-    echo "================================================"
+-
++    echo "Model    : ${MODEL_NAME} @ ${MODEL_PATH}"
++    echo "Engine ID: ${ENGINE_ID}"
+     echo "CLUSTER INFO ===================================="
+-    echo "================================================"
+     echo "${host_name}:${host_ip} is Proxy Node"
+-    echo "${PREFILL_ARGS} are Proxy's Prefill"
+-    echo "${DECODE_ARGS} are Proxy's Decode"
++    echo "Prefill: ${PREFILL_ARGS}"
++    echo "Decode:  ${DECODE_ARGS}"
+     echo "================================================"
+-    
+ 
+-    # =============================================================================
+-    # Wait for PD servers
+-    # =============================================================================
+     PD_IPADDRS="${IPADDRS#*,}"
+     echo "Waiting for all prefill and decode servers to be up . . ."
+-    python $NIXL_COOKBOOK_PATH/socket_barrier.py \
++    python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
+         --node-ips ${PD_IPADDRS} \
+-        --node-ports $SERVER_PORT
++        --node-ports $SERVER_PORT \
++        --wait-for-all-ports \
++        --timeout 1800
+ 
+     if [ "$PROXY_TYPE" == "vllm_router" ]; then
+-        echo "Starting vLLM Router (Production Proxy)..."
++        echo "Starting vLLM Router..."
+         [ -f /root/.cargo/env ] && source /root/.cargo/env
+-        
++
+         PREFILL_URLS=""
+         DECODE_URLS=""
+         for ip in ${PREFILL_ARGS}; do
+-            PREFILL_URLS+="--prefill-url http://${ip}:${SERVER_PORT}/v1 "
++            PREFILL_URLS+="--prefill http://${ip}:${SERVER_PORT} "
+         done
+         for ip in ${DECODE_ARGS}; do
+-            DECODE_URLS+="--decode-url http://${ip}:${SERVER_PORT}/v1 "
++            DECODE_URLS+="--decode http://${ip}:${SERVER_PORT} "
+         done
+-        
+-        UCX_TLS=tcp,self,shm VLLM_USE_V1=1 \
++
++        ROUTER_CMD="UCX_TLS=tcp,self,shm VLLM_USE_V1=1 \
+         vllm-router \
+             --host 0.0.0.0 \
+             --port $ROUTER_PORT \
+@@ -248,146 +252,159 @@ if [ "$NODE_RANK" -eq 0 ]; then
+             --decode-policy round_robin \
+             --intra-node-data-parallel-size 1 \
+             --retry-max-retries 3 \
+-            --prometheus-port 29000 \
+-            2>&1 | tee /run_logs/${SLURM_JOB_ID}/vllm_router_NODE${NODE_RANK}.log >/dev/null &
+-        proxy_pid=$!
++            --health-check-endpoint /health \
++            --prometheus-port 29000"
++
++        if [[ "$DRY_RUN" -eq 1 ]]; then echo "DRY RUN: $ROUTER_CMD"
++        else
++            eval "$ROUTER_CMD" \
++                2>&1 | tee /run_logs/${SLURM_JOB_ID}/vllm_router_NODE${NODE_RANK}.log >/dev/null &
++            proxy_pid=$!
++        fi
+         PROXY_PORT=$ROUTER_PORT
+     else
+         echo "Starting Toy Proxy Server..."
+-
+-        UCX_TLS=tcp,self,shm NCCL_UCX_TLS=tcp VLLM_USE_V1=1 \
+-        python3 "/app/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
++        PROXY_CMD="UCX_TLS=tcp,self,shm NCCL_UCX_TLS=tcp VLLM_USE_V1=1 \
++        python3 \"/app/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py\" \
+                 --host 0.0.0.0 \
+                 --port $SERVER_PORT \
+                 --prefiller-hosts ${PREFILL_ARGS} \
+                 --prefiller-ports ${PREFILL_PORTS} \
+                 --decoder-hosts ${DECODE_ARGS} \
+-                --decoder-ports ${DECODE_PORTS} 2>&1 | tee /run_logs/${SLURM_JOB_ID}/proxy_NODE${NODE_RANK}.log >/dev/null &
+-        proxy_pid=$!
++                --decoder-ports ${DECODE_PORTS}"
++
++        if [[ "$DRY_RUN" -eq 1 ]]; then echo "DRY RUN: $PROXY_CMD"
++        else
++            eval "$PROXY_CMD" \
++                2>&1 | tee /run_logs/${SLURM_JOB_ID}/proxy_NODE${NODE_RANK}.log >/dev/null &
++            proxy_pid=$!
++        fi
+         PROXY_PORT=$SERVER_PORT
+     fi
+-    
++
+     echo "Waiting for proxy server to be up . . ."
+-    python $NIXL_COOKBOOK_PATH/socket_barrier.py \
++    python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
+         --node-ips ${host_ip} \
+-        --node-ports $PROXY_PORT
+-
+-    echo "Proxy Server ($PROXY_TYPE) Ready for benchmarking on ${host_name}:${host_ip}:${PROXY_PORT}"
++        --node-ports $PROXY_PORT \
++        --wait-for-all-ports \
++        --timeout 600
+ 
+-    sleep 10;
++    echo "Proxy Server ($PROXY_TYPE) Ready on ${host_name}:${host_ip}:${PROXY_PORT}"
++    sleep 10
+     export BENCHMARK_PORT=$PROXY_PORT
+-    bash $NIXL_COOKBOOK_PATH/benchmark_xPyD.sh
++
++    if [[ "$DRY_RUN" -eq 1 ]]; then echo "DRY RUN: bash $NIXL_COOKBOOK_PATH/benchmark_xPyD.sh"
++    else bash $NIXL_COOKBOOK_PATH/benchmark_xPyD.sh; fi
+ 
+     echo "Killing the proxy server"
+-    kill $proxy_pid
++    [[ "$DRY_RUN" -eq 0 ]] && kill $proxy_pid
+ 
+-elif  [ "$NODE_RANK" -gt 0 ] && [ "$NODE_RANK" -le "$xP" ]; then
+-    echo "${host_name}:${host_ip} is Prefill Node (Model: ${MODEL_NAME:-'default'})"
++elif [ "$NODE_RANK" -gt 0 ] && [ "$NODE_RANK" -le "$xP" ]; then
++    echo "${host_name}:${host_ip} is Prefill Node (Model: ${MODEL_NAME})"
+     echo "Using prefill config: $PREFILL_MODEL_CONFIG"
+ 
+-    PREFILL_CMD="LD_LIBRARY_PATH=/app/install/nixl/lib/x86_64-linux-gnu/:/app/install/ucx/lib:/opt/rocm/lib:\$LD_LIBRARY_PATH \
+-    ${PREFILL_MODEL_ENVS} \
+-    VLLM_USE_V1=1 \
+-    VLLM_SERVER_DEV_MODE=0 \
+-    VLLM_NIXL_SIDE_CHANNEL_HOST=\${host_ip} \
+-    VLLM_NIXL_SIDE_CHANNEL_PORT=5557 \
+-    UCX_TLS=rc,sm,self,rocm_copy,rocm_ipc,tcp \
+-    UCX_NET_DEVICES=mlx5_0:1 \
+-    UCX_SOCKADDR_TLS_PRIORITY=rdmacm,tcp \
+-    UCX_SOCKADDR_CM_ENABLE=y \
+-    UCX_RDMA_CM_ENABLED=y \
+-    UCX_MEMTYPE_CACHE=y \
+-    UCX_RNDV_SCHEME=get_zcopy \
+-    UCX_RNDV_THRESH=4k \
+-    UCX_ROCM_IPC_MIN_ZCOPY=0 \
+-    HSA_ENABLE_SDMA=1 \
+-    UCX_LOG_LEVEL=info \
+-    NIXL_LOG_LEVEL=DEBUG \
+-    HSA_ENABLE_SDMA=1 \
+-    vllm serve \${MODEL_PATH} \
++    # Export UCX/Nixl env vars so child processes (Workers) inherit them
++    export UCX_TLS=all
++    export UCX_SOCKADDR_TLS_PRIORITY=tcp
++    export UCX_MEMTYPE_CACHE=y
++    export UCX_RNDV_SCHEME=get_zcopy
++    export UCX_RNDV_THRESH=4k
++    export UCX_ROCM_IPC_MIN_ZCOPY=0
++    export HSA_ENABLE_SDMA=1
++    export UCX_LOG_LEVEL=info
++    export NIXL_LOG_LEVEL=DEBUG
++    export VLLM_USE_V1=1
++    export VLLM_SERVER_DEV_MODE=0
++    export VLLM_NIXL_SIDE_CHANNEL_HOST=${host_ip}
++    export VLLM_NIXL_SIDE_CHANNEL_PORT=5557
++
++    for env_pair in ${PREFILL_MODEL_ENVS}; do
++        export "$env_pair"
++    done
++
++    PREFILL_CMD="vllm serve \${MODEL_PATH} \
+         --port $SERVER_PORT \
+         --trust-remote-code \
+         --disable-log-requests \
+-        --kv-transfer-config '{\"kv_connector\": \"NixlConnector\", \"engine_id\": \"pd-run\", \"kv_role\": \"kv_producer\", \"kv_parallel_size\": 8, \"kv_rank\": 0, \"kv_buffer_size\": 5000000000, \"kv_buffer_device\": \"cuda\", \"kv_ip\": \"'\"\${host_ip}\"'\", \"kv_port\": 14600}'"
++        --kv-transfer-config '{\"kv_connector\": \"NixlConnector\", \"engine_id\": \"${ENGINE_ID}\", \"kv_role\": \"kv_producer\", \"kv_parallel_size\": 8, \"kv_rank\": 0, \"kv_buffer_size\": 5000000000, \"kv_buffer_device\": \"cuda\", \"kv_ip\": \"'\"\${rdma_ip}\"'\", \"kv_port\": 14600}'"
+ 
+     if [[ -n "$PREFILL_MODEL_CONFIG" ]]; then
+         PREFILL_CMD="$PREFILL_CMD $PREFILL_MODEL_CONFIG"
+     fi
+ 
+-    eval "$PREFILL_CMD" \
+-        2>&1 | tee /run_logs/${SLURM_JOB_ID}/prefill_NODE${NODE_RANK}.log >/dev/null &
+-
+-    prefill_pid=$!
++    if [[ "$DRY_RUN" -eq 1 ]]; then echo "DRY RUN: $PREFILL_CMD"
++    else
++        eval "$PREFILL_CMD" \
++            2>&1 | tee /run_logs/${SLURM_JOB_ID}/prefill_NODE${NODE_RANK}.log >/dev/null &
++        prefill_pid=$!
++    fi
+ 
+     echo "Waiting for proxy server to be up..."
+-    python $NIXL_COOKBOOK_PATH/socket_barrier.py \
+-        --node-ips ${MASTER_ADDR} \
+-        --node-ports $PROXY_PORT
++    python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
++        --node-ips ${MASTER_ADDR} --node-ports $PROXY_PORT \
++        --wait-for-all-ports --timeout 1800
+ 
+-    echo "Waiting untill proxy server closes..."
+-    python $NIXL_COOKBOOK_PATH/socket_wait.py \
+-        --remote-ip ${MASTER_ADDR} \
+-        --remote-port $PROXY_PORT
++    echo "Waiting until proxy server closes..."
++    python3 $NIXL_COOKBOOK_PATH/sync.py wait \
++        --remote-ip ${MASTER_ADDR} --remote-port $PROXY_PORT
+ 
+     echo "Killing the prefill server"
+-    kill $prefill_pid
++    [[ "$DRY_RUN" -eq 0 ]] && kill $prefill_pid
+ 
+ else
+-    echo "${host_name}:${host_ip} is Decode Node (Model: ${MODEL_NAME:-'default'})"
++    echo "${host_name}:${host_ip} is Decode Node (Model: ${MODEL_NAME})"
+     echo "Using decode config: $DECODE_MODEL_CONFIG"
+ 
+-
+-    DECODE_CMD="LD_LIBRARY_PATH=/app/install/nixl/lib/x86_64-linux-gnu/:/app/install/ucx/lib:/opt/rocm/lib:\$LD_LIBRARY_PATH \
+-    ${DECODE_MODEL_ENVS} \
+-    VLLM_USE_V1=1 \
+-    VLLM_SERVER_DEV_MODE=0 \
+-    VLLM_NIXL_SIDE_CHANNEL_HOST=\${host_ip} \
+-    VLLM_NIXL_SIDE_CHANNEL_PORT=5557 \
+-    UCX_TLS=rc,sm,self,rocm_copy,rocm_ipc,tcp \
+-    UCX_NET_DEVICES=mlx5_0:1 \
+-    UCX_SOCKADDR_TLS_PRIORITY=rdmacm,tcp \
+-    UCX_SOCKADDR_CM_ENABLE=y \
+-    UCX_RDMA_CM_ENABLED=y \
+-    UCX_MEMTYPE_CACHE=y \
+-    UCX_RNDV_SCHEME=get_zcopy \
+-    UCX_RNDV_THRESH=4k \
+-    UCX_ROCM_IPC_MIN_ZCOPY=0 \
+-    HSA_ENABLE_SDMA=1 \
+-    UCX_LOG_LEVEL=info \
+-    NIXL_LOG_LEVEL=DEBUG \
+-    HSA_ENABLE_SDMA=1 \
+-    vllm serve \${MODEL_PATH} \
++    export UCX_TLS=all
++    export UCX_SOCKADDR_TLS_PRIORITY=tcp
++    export UCX_MEMTYPE_CACHE=y
++    export UCX_RNDV_SCHEME=get_zcopy
++    export UCX_RNDV_THRESH=4k
++    export UCX_ROCM_IPC_MIN_ZCOPY=0
++    export HSA_ENABLE_SDMA=1
++    export UCX_LOG_LEVEL=info
++    export NIXL_LOG_LEVEL=DEBUG
++    export VLLM_USE_V1=1
++    export VLLM_SERVER_DEV_MODE=0
++    export VLLM_NIXL_SIDE_CHANNEL_HOST=${host_ip}
++    export VLLM_NIXL_SIDE_CHANNEL_PORT=5557
++
++    for env_pair in ${DECODE_MODEL_ENVS}; do
++        export "$env_pair"
++    done
++
++    DECODE_CMD="vllm serve \${MODEL_PATH} \
+         --port $SERVER_PORT \
+         --trust-remote-code \
+         --disable-log-requests \
+-        --kv-transfer-config '{\"kv_connector\": \"NixlConnector\", \"engine_id\": \"llama8b-run\", \"kv_role\": \"kv_consumer\", \"kv_parallel_size\": 8, \"kv_rank\": 0, \"kv_buffer_size\": 5000000000, \"kv_buffer_device\": \"cuda\", \"kv_ip\": \"'\"\${host_ip}\"'\", \"kv_port\": 14600}'"
++        --kv-transfer-config '{\"kv_connector\": \"NixlConnector\", \"engine_id\": \"${ENGINE_ID}\", \"kv_role\": \"kv_consumer\", \"kv_parallel_size\": 8, \"kv_rank\": 0, \"kv_buffer_size\": 5000000000, \"kv_buffer_device\": \"cuda\", \"kv_ip\": \"'\"\${rdma_ip}\"'\", \"kv_port\": 14600}'"
+ 
+     if [[ -n "$DECODE_MODEL_CONFIG" ]]; then
+         DECODE_CMD="$DECODE_CMD $DECODE_MODEL_CONFIG"
+     fi
+ 
+-    eval "$DECODE_CMD" \
+-        2>&1 | tee /run_logs/${SLURM_JOB_ID}/decode_NODE${NODE_RANK}.log >/dev/null &
+-
+-    decode_pid=$!
++    if [[ "$DRY_RUN" -eq 1 ]]; then echo "DRY RUN: $DECODE_CMD"
++    else
++        eval "$DECODE_CMD" \
++            2>&1 | tee /run_logs/${SLURM_JOB_ID}/decode_NODE${NODE_RANK}.log >/dev/null &
++        decode_pid=$!
++    fi
+ 
+     echo "Waiting for proxy server to be up..."
+-    python $NIXL_COOKBOOK_PATH/socket_barrier.py \
+-        --node-ips ${MASTER_ADDR} \
+-        --node-ports $PROXY_PORT
++    python3 $NIXL_COOKBOOK_PATH/sync.py barrier \
++        --node-ips ${MASTER_ADDR} --node-ports $PROXY_PORT \
++        --wait-for-all-ports --timeout 1800
+ 
+-    echo "Waiting untill proxy server closes..."
+-    python $NIXL_COOKBOOK_PATH/socket_wait.py \
+-        --remote-ip ${MASTER_ADDR} \
+-        --remote-port $PROXY_PORT
++    echo "Waiting until proxy server closes..."
++    python3 $NIXL_COOKBOOK_PATH/sync.py wait \
++        --remote-ip ${MASTER_ADDR} --remote-port $PROXY_PORT
+ 
+     echo "Killing the decode server"
+-    kill $decode_pid
+-
++    [[ "$DRY_RUN" -eq 0 ]] && kill $decode_pid
+ fi
+ 
+ echo "Killing the etcd server"
+-kill $etcd_pid 
++kill $etcd_pid
+ 
+ echo "Script completed successfully"
+ exit 0
