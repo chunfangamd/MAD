@@ -117,6 +117,11 @@ RUN git clone --depth 1 https://github.com/vllm-project/vllm.git /tmp/vllm-src &
     cp -r /tmp/vllm-src/tests /app/vllm/tests && \
     rm -rf /tmp/vllm-src
 
+# Install AMD Pensando ionic RDMA verbs provider (for RoCEv2 KV transfer via Nixl).
+# The deb comes from the host's /opt/amd/ainic/deb-repo; copy it to the build context.
+COPY libionic1_54.0-149.g3304be71_amd64.deb /tmp/libionic1.deb
+RUN dpkg -i /tmp/libionic1.deb && rm /tmp/libionic1.deb
+
 # Install Rust compiler (required for building vllm-router)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
